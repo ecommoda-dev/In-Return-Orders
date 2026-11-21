@@ -8,7 +8,7 @@
 للمخزن و**محدش سجّل لها `Returned`** لسه — في الشحنة الأصلية
 (`custom.manual_status`) أو دورة الاستبدال/الاسترجاع (`custom.status_2_r_e`).
 **مين بيستخدمها:** الشحن والتحصيل
-**الإصدار:** `1.1.0` (`WORKER_VERSION` في `index.js`)
+**الإصدار:** `1.2.0` (`WORKER_VERSION` في `index.js`)
 
 > 🔴 **الريبو ده Worker وبس — مفيش واجهة هنا ومفيش نسخة مستقلة.** الواجهة
 > الوحيدة هي **`In-Return-Orders.html`** جوّه `Delivery-COD-Operations-Center`
@@ -94,6 +94,11 @@ created_at:>='<بداية 01/04/2026 بتوقيت القاهرة>'     ← ال�
   `null` على أوردر RTO بلا Return. 🔴 **بتتطلب `read_returns`** وغيابها بيوقّع الطابور كله
   (بند في `diag`). الاستعلام `returns(first: 10, reverse: true)` بـ`createdAt status` بس.
   ⚠️ **التكلفة مش مقيسة** بعد الإضافة — راجع `queryCost` أول فتح.
+- 🟢 **`1.2.0` — نوع الدورة:** `returnKind` = `exchange` (أحدث دورة فيها `exchangeLineItems`) ·
+  `return_unconfirmed` (فاضية — **مش «استرجاع»**، قاعدة 8: تعديل أوردر بعد تسجيل الاستبدال بيفضّيها)
+  · `null` (مفيش دورة أو التمريرة التانية فشلت). بتتجاب بـ`nodes(ids:)` على الـ`Return` نفسه
+  (أحدث دورة لكل أوردر · `first: 1` · شرايح `RETURN_KIND_CHUNK = 25`). 🔴 فشلها **ما بيوقّعش الطابور**
+  — `returnKindError` في الرد. ⚠️ **تكلفتها مش مقيسة** — راجع `queryCost` (`op: 'returnKinds'`).
 - ⚠️ **الشكل عقد**: `ecoShapeRow` و`ecoFlags` و`ecoCod` في `shared/dco-rules.js`
   بيقروا المفاتيح بالاسم. تغيير اسم مفتاح = عمود بيرجع `—` بلا أي خطأ.
 - 🔴 `currentTotalPriceSet` مش `totalPriceSet` (قاعدة ٣) · 🔴 `orderId` رقمي ·

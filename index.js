@@ -32,7 +32,7 @@
 //    (حدث RTO · أو EXCHANGE/CUSTOMER_RETURN_PICKUP بعد الحدث 23) وكتابة يدوية
 //    من `Order-Status-Updater`. الطابور مايفرّقش — بيقرا القيمة.
 // ══════════════════════════════════════════════════════════════
-const WORKER_VERSION = '1.1.0';   // 1.1.0: returnRequestedAt — تاريخ آخر Return request (عمود «تاريخ الطلب»)
+const WORKER_VERSION = '1.2.0';   // 1.1.0: returnRequestedAt (عمود «تاريخ الطلب») · 1.2.0: returnKind (استبدال / استرجاع غير مؤكد) بتمريرة تانية
 const TOOL_LABEL     = 'in_return_orders';   // للتعريف في `diag` بس — **مش** قيمة `tool` في D1
 
 // ══════════════════════════════════════════════════════════════
@@ -362,7 +362,7 @@ const ORDER_FIELDS = `
   #    أكتر من دورة، والمطلوب تاريخ **آخر** واحدة (order-lifecycle Rule 15).
   #    ⚠️ بنجيب createdAt وstatus بس — **مفيش** exchangeLineItems/returnLineItems
   #    (~١٠٨ نقطة للأوردر — shopify-graphql-helper Step 10) عشان سقف الصفحة (٤٠) يفضل آمن.
-  returns(first: 10, reverse: true) { nodes { name createdAt status } }
+  returns(first: 10, reverse: true) { nodes { id name createdAt status } }
 `;
 
 const QUEUE_QUERY = `
@@ -387,6 +387,35 @@ function latestReturn(o) {
   return { latest: live[live.length - 1] || null, count: live.length };
 }
 
+// ─── §QUEUE::returnKinds — استبدال ولا استرجاع؟ (v1.2.0 · تمريرة تانية) ───
+// 🔴 `order-lifecycle` قاعدة 8: النوع من `return.exchangeLineItems` — **مش** من ميتافيلد.
+//    ⚠️ **والعكس مش صحيح:** الـ connection الفاضية = «مفيش قطع استبدال مسجّلة على الدورة دي»
+//    **مش** «ده استرجاع» (تعديل أوردر بعد تسجيل الاستبدال بيفضّيها للأبد — #53531 · #53701).
+//    عشان كده القيمة الراجعة `exchange` أو `return_unconfirmed` — مفيش `return` صريحة.
+// 🔴 **تمريرة تانية بـ`nodes(ids:)` على الـ Return نفسه** (مش جوّه استعلام الأوردرات): بلوك
+//    `exchangeLineItems` غالي (shopify-graphql-helper Step 10 · §3.4)، وهنا بيتجاب **لدورة
+//    واحدة بس لكل أوردر** (الأحدث غير الملغية) وبـ`first: 1` — مجرد «فيه ولا لأ».
+// ⚠️ **تكلفة الشريحة مش مقيسة** (`actualQueryCost`) — `RETURN_KIND_CHUNK` تخمين متحفّظ،
+//    وبتتسجّل في `queryCost` (op = `returnKinds`).
+// ⚠️ **فشل التمريرة دي ما بيوقّعش الطابور** — النوع بس بيبقى غير معروف (`returnKind: null`)
+//    والواجهة بترجع للتسمية العامة، و`returnKindError` بيقول السبب في الرد.
+const RETURN_KIND_CHUNK = 25;
+const RETURN_KIND_QUERY = `
+query ReturnKinds($ids: [ID!]!) {
+  nodes(ids: $ids) { ... on Return { id exchangeLineItems(first: 1) { nodes { id } } } }
+}`;
+async function fetchReturnKinds(env, token, gids, costLog) {
+  const kinds = new Map();   // gid → true (فيه استبدال) | false (مفيش مسجّل)
+  for (let i = 0; i < gids.length; i += RETURN_KIND_CHUNK) {
+    const chunk = gids.slice(i, i + RETURN_KIND_CHUNK);
+    const data = await shopifyGQL(env, token, RETURN_KIND_QUERY, { ids: chunk }, 'returnKinds', costLog);
+    const nodes = data.data?.nodes;
+    if (!Array.isArray(nodes)) throw new Error('returnKinds: رد شوبيفاي بلا nodes');
+    for (const n of nodes) if (n?.id) kinds.set(n.id, (n.exchangeLineItems?.nodes?.length || 0) > 0);
+  }
+  return kinds;
+}
+
 // ─── §QUEUE::shapeOrder ───
 // ⚠️ الشكل ده **عقد مع الواجهة**: `ecoShapeRow` و`ecoFlags` و`ecoCod` في
 //    `shared/dco-rules.js` بيقروا المفاتيح دي **بالاسم**. تغيير اسم مفتاح هنا
@@ -394,7 +423,7 @@ function latestReturn(o) {
 //    (نفس الشكل بالحرف بتاع `shipped-orders-worker` 1.2.0.)
 // 🔴 **`orderId` رقمي إلزامي** (worker-builder Step 5 § Numeric Order ID) —
 //    الواجهة بتبني بيه رابط الأدمن، والـ `gid` مايبنيش رابط.
-function shapeOrder(o) {
+function shapeOrder(o, kinds = null) {
   const { latest: lastReturn, count: returnCycles } = latestReturn(o);
   return {
     orderId:   o.legacyResourceId || (o.id ? String(o.id).split('/').pop() : null),
@@ -436,6 +465,11 @@ function shapeOrder(o) {
     returnName:        lastReturn?.name      || null,   // مثلاً #62855-R2
     returnStatus:      lastReturn?.status    || null,
     returnCycles,                                       // عدد الدورات غير الملغية (>1 = أكتر من دورة)
+    // 🟢 v1.2.0 — `exchange` لو أحدث دورة فيها قطع استبدال مسجّلة · `return_unconfirmed` لو فاضية
+    //    (مش «استرجاع» — قاعدة 8) · `null` لو مفيش دورة أو التمريرة التانية فشلت/ما رجّعتش الدورة دي.
+    returnKind: !lastReturn || !kinds || !kinds.has(lastReturn.id)
+      ? null
+      : (kinds.get(lastReturn.id) ? 'exchange' : 'return_unconfirmed'),
   };
 }
 
@@ -497,9 +531,20 @@ async function handleQueue(env, request) {
     fetchStatusPage(env, token, queueQ(since, `metafields.custom.status_2_r_e:'${S2_STATUS.IN_RETURN}'`),  'inReturnS2'),
   ]);
 
+  // v1.2.0 — نوع الدورة (استبدال/استرجاع) بتمريرة تانية على أحدث دورة لكل أوردر
+  const allNodes = [...a.nodes, ...b.nodes];
+  const kindGids = [...new Set(allNodes.map(n => latestReturn(n).latest?.id).filter(Boolean))];
+  const kindCost = [];
+  let kinds = null, returnKindError = null;
+  if (kindGids.length) {
+    try { kinds = await fetchReturnKinds(env, token, kindGids, kindCost); }
+    catch (e) { returnKindError = e.message; }   // ⚠️ مش بنوقّع الطابور — النوع بس بيبقى مجهول
+  }
+  const kc = kindCost.map(c => c.actual).filter(n => typeof n === 'number');
+
   const byId = new Map();
-  for (const n of [...a.nodes, ...b.nodes]) {
-    const s = shapeOrder(n);
+  for (const n of allNodes) {
+    const s = shapeOrder(n, kinds);
     if (s.orderId) byId.set(s.orderId, s);
   }
 
@@ -515,7 +560,10 @@ async function handleQueue(env, request) {
     minCreatedAt:  since,
     // ⑮ للقياس بس — **صفر اعتماد من الواجهة عليه**. مصفوفة تفصيل لكل استعلام
     //    (مش رقم مجمّع).
-    queryCost: [a.cost, b.cost],
+    returnKindError,       // null = تمام · نص = التمريرة التانية فشلت (النوع مجهول، الطابور سليم)
+    queryCost: [a.cost, b.cost,
+      { op: 'returnKinds', pages: kindCost.length, truncated: false,
+        requested: kindCost[0]?.requested ?? null, actualMax: kc.length ? Math.max(...kc) : null }],
     fetchedAt: new Date().toISOString(),
     cairoDate: cairoDate(),
   }, 200, request);
