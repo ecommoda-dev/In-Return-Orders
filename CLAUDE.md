@@ -8,7 +8,7 @@
 للمخزن و**محدش سجّل لها `Returned`** لسه — في الشحنة الأصلية
 (`custom.manual_status`) أو دورة الاستبدال/الاسترجاع (`custom.status_2_r_e`).
 **مين بيستخدمها:** الشحن والتحصيل
-**الإصدار:** `1.0.0` (`WORKER_VERSION` في `index.js`)
+**الإصدار:** `1.1.0` (`WORKER_VERSION` في `index.js`)
 
 > 🔴 **الريبو ده Worker وبس — مفيش واجهة هنا ومفيش نسخة مستقلة.** الواجهة
 > الوحيدة هي **`In-Return-Orders.html`** جوّه `Delivery-COD-Operations-Center`
@@ -89,6 +89,11 @@ created_at:>='<بداية 01/04/2026 بتوقيت القاهرة>'     ← ال�
 `currency` · `zone` · `courier` · `s1` · `s2` · `packedAtS1`/`S2` ·
 `packedByS1`/`S2` · `trackingS1`/`S2` · `trackingLegacy`.
 
+- 🟢 **`1.1.0` — «تاريخ الطلب»:** `returnRequestedAt` (= `Return.createdAt` لأحدث دورة غير
+  ملغية، مرتّبة بـ`createdAt` — Rule 15) · `returnName` · `returnStatus` · `returnCycles`.
+  `null` على أوردر RTO بلا Return. 🔴 **بتتطلب `read_returns`** وغيابها بيوقّع الطابور كله
+  (بند في `diag`). الاستعلام `returns(first: 5, reverse: true)` بـ`createdAt status` بس.
+  ⚠️ **التكلفة مش مقيسة** بعد الإضافة — راجع `queryCost` أول فتح.
 - ⚠️ **الشكل عقد**: `ecoShapeRow` و`ecoFlags` و`ecoCod` في `shared/dco-rules.js`
   بيقروا المفاتيح بالاسم. تغيير اسم مفتاح = عمود بيرجع `—` بلا أي خطأ.
 - 🔴 `currentTotalPriceSet` مش `totalPriceSet` (قاعدة ٣) · 🔴 `orderId` رقمي ·

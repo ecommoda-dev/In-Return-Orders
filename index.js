@@ -32,7 +32,7 @@
 //    (حدث RTO · أو EXCHANGE/CUSTOMER_RETURN_PICKUP بعد الحدث 23) وكتابة يدوية
 //    من `Order-Status-Updater`. الطابور مايفرّقش — بيقرا القيمة.
 // ══════════════════════════════════════════════════════════════
-const WORKER_VERSION = '1.0.0';
+const WORKER_VERSION = '1.1.0';   // 1.1.0: returnRequestedAt — تاريخ آخر Return request (عمود «تاريخ الطلب»)
 const TOOL_LABEL     = 'in_return_orders';   // للتعريف في `diag` بس — **مش** قيمة `tool` في D1
 
 // ══════════════════════════════════════════════════════════════
@@ -357,6 +357,12 @@ const ORDER_FIELDS = `
   tr1:     metafield(namespace: "custom", key: "bosta_tracking_number_s1") { value }
   tr2:     metafield(namespace: "custom", key: "bosta_tracking_number_s2") { value }
   tr0:     metafield(namespace: "custom", key: "bosta_tracking_number") { value }
+  # 🔴 دورات الاسترجاع/الاستبدال — لعمود «تاريخ الطلب» (v1.1.0). تتطلب read_returns.
+  #    reverse: true + first: 5 = **أحدث** ٥ دورات (مش الأقدم) — الأوردر ممكن يفتح
+  #    أكتر من دورة، والمطلوب تاريخ **آخر** واحدة (order-lifecycle Rule 15).
+  #    ⚠️ بنجيب createdAt وstatus بس — **مفيش** exchangeLineItems/returnLineItems
+  #    (~١٠٨ نقطة للأوردر — shopify-graphql-helper Step 10) عشان سقف الصفحة (٤٠) يفضل آمن.
+  returns(first: 5, reverse: true) { nodes { name createdAt status } }
 `;
 
 const QUEUE_QUERY = `
@@ -367,6 +373,20 @@ query InReturnQueue($q: String!, $after: String, $n: Int!) {
   }
 }`;
 
+// ─── §QUEUE::latestReturn — آخر Return request على الأوردر ───
+// 🔴 Rule 15: الدورات **بتترتّب بـ`createdAt`** (مش بموضع المصفوفة)، والمقروء
+//    **أحدث دورة غير ملغية** — `CANCELED`/`DECLINED` عمرها ما بقت دورة حقيقية.
+//    ⚠️ «تاريخ الطلب» = لحظة إنشاء الـ Return على شوبيفاي (`Return.createdAt`)،
+//    مش `requestApprovedAt` ولا `closedAt`.
+//    ⚠️ أوردر S1 = In-Return (RTO) عادةً مالوش Return أصلاً → `null` (الواجهة بتعرض «—»،
+//    وده **مش** خطأ ولا علامة مراجعة).
+function latestReturn(o) {
+  const all = (o.returns?.nodes || []).filter(r => r && r.createdAt);
+  const live = all.filter(r => !['CANCELED', 'DECLINED'].includes(r.status));
+  live.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  return { latest: live[live.length - 1] || null, count: live.length };
+}
+
 // ─── §QUEUE::shapeOrder ───
 // ⚠️ الشكل ده **عقد مع الواجهة**: `ecoShapeRow` و`ecoFlags` و`ecoCod` في
 //    `shared/dco-rules.js` بيقروا المفاتيح دي **بالاسم**. تغيير اسم مفتاح هنا
@@ -375,6 +395,7 @@ query InReturnQueue($q: String!, $after: String, $n: Int!) {
 // 🔴 **`orderId` رقمي إلزامي** (worker-builder Step 5 § Numeric Order ID) —
 //    الواجهة بتبني بيه رابط الأدمن، والـ `gid` مايبنيش رابط.
 function shapeOrder(o) {
+  const { latest: lastReturn, count: returnCycles } = latestReturn(o);
   return {
     orderId:   o.legacyResourceId || (o.id ? String(o.id).split('/').pop() : null),
     orderGid:  o.id,
@@ -410,6 +431,11 @@ function shapeOrder(o) {
     trackingS1: o.tr1?.value || null,
     trackingS2: o.tr2?.value || null,
     trackingLegacy: o.tr0?.value || null,
+    // 🟢 v1.1.0 — إضافة بحتة (مفيش مفتاح اتغيّر)، فمفيش داعي لرفع `min` في الواجهة.
+    returnRequestedAt: lastReturn?.createdAt || null,   // تاريخ آخر Return request
+    returnName:        lastReturn?.name      || null,   // مثلاً #62855-R2
+    returnStatus:      lastReturn?.status    || null,
+    returnCycles,                                       // عدد الدورات غير الملغية (>1 = أكتر من دورة)
   };
 }
 
@@ -546,6 +572,14 @@ async function handleDiag(env, request) {
     push(canRead, 'صلاحية قراءة الأوردرات',
          canRead ? `موجودة (${scopes.filter(s => /orders/.test(s)).join(', ')})` : 'ناقصة — الطابور هيرجع فاضي',
          'Custom App → Configuration → Admin API access scopes');
+
+    // 🔴 **`read_returns` (v1.1.0)** — عمود «تاريخ الطلب» بيقرا `order.returns`. غيابها
+    //    = **top-level error** على الاستعلام كله (مش حقل فاضي) → الطابور كله بيقع.
+    const readReturns = scopes.includes('read_returns') || scopes.includes('write_returns');
+    push(readReturns, 'صلاحية read_returns',
+         readReturns ? 'موجودة — عمود «تاريخ الطلب» شغّال'
+                     : '🔴 ناقصة — الطابور كله هيفشل بخطأ صلاحية (بسبب order.returns)',
+         'Custom App → Configuration → Admin API access scopes → read_returns ثم Promote');
 
     // 🔴 **`read_all_orders` — وأثره هنا زي «المشحون»:** شوبيفاي بتخفي أي أوردر
     //    أقدم من **٦٠ يوم** عن تطبيق مالوش الصلاحية، **بلا أي خطأ**. ومرتجع
