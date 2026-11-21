@@ -92,7 +92,7 @@ created_at:>='<بداية 01/04/2026 بتوقيت القاهرة>'     ← ال�
 - 🟢 **`1.1.0` — «تاريخ الطلب»:** `returnRequestedAt` (= `Return.createdAt` لأحدث دورة غير
   ملغية، مرتّبة بـ`createdAt` — Rule 15) · `returnName` · `returnStatus` · `returnCycles`.
   `null` على أوردر RTO بلا Return. 🔴 **بتتطلب `read_returns`** وغيابها بيوقّع الطابور كله
-  (بند في `diag`). الاستعلام `returns(first: 5, reverse: true)` بـ`createdAt status` بس.
+  (بند في `diag`). الاستعلام `returns(first: 10, reverse: true)` بـ`createdAt status` بس.
   ⚠️ **التكلفة مش مقيسة** بعد الإضافة — راجع `queryCost` أول فتح.
 - ⚠️ **الشكل عقد**: `ecoShapeRow` و`ecoFlags` و`ecoCod` في `shared/dco-rules.js`
   بيقروا المفاتيح بالاسم. تغيير اسم مفتاح = عمود بيرجع `—` بلا أي خطأ.

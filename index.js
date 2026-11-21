@@ -358,11 +358,11 @@ const ORDER_FIELDS = `
   tr2:     metafield(namespace: "custom", key: "bosta_tracking_number_s2") { value }
   tr0:     metafield(namespace: "custom", key: "bosta_tracking_number") { value }
   # 🔴 دورات الاسترجاع/الاستبدال — لعمود «تاريخ الطلب» (v1.1.0). تتطلب read_returns.
-  #    reverse: true + first: 5 = **أحدث** ٥ دورات (مش الأقدم) — الأوردر ممكن يفتح
+  #    reverse: true + first: 10 = **أحدث** ١٠ دورات (مش الأقدم) — الأوردر ممكن يفتح
   #    أكتر من دورة، والمطلوب تاريخ **آخر** واحدة (order-lifecycle Rule 15).
   #    ⚠️ بنجيب createdAt وstatus بس — **مفيش** exchangeLineItems/returnLineItems
   #    (~١٠٨ نقطة للأوردر — shopify-graphql-helper Step 10) عشان سقف الصفحة (٤٠) يفضل آمن.
-  returns(first: 5, reverse: true) { nodes { name createdAt status } }
+  returns(first: 10, reverse: true) { nodes { name createdAt status } }
 `;
 
 const QUEUE_QUERY = `
