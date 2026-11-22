@@ -32,7 +32,7 @@
 //    (حدث RTO · أو EXCHANGE/CUSTOMER_RETURN_PICKUP بعد الحدث 23) وكتابة يدوية
 //    من `Order-Status-Updater`. الطابور مايفرّقش — بيقرا القيمة.
 // ══════════════════════════════════════════════════════════════
-const WORKER_VERSION = '1.2.0';   // 1.1.0: returnRequestedAt (عمود «تاريخ الطلب») · 1.2.0: returnKind (استبدال / استرجاع غير مؤكد) بتمريرة تانية
+const WORKER_VERSION = '1.3.0';   // 1.1.0: returnRequestedAt (عمود «تاريخ الطلب») · 1.2.0: returnKind بتمريرة تانية · 1.3.0: returnKind من دفتر agreements (order-lifecycle v1.11.1 · §2-D)
 const TOOL_LABEL     = 'in_return_orders';   // للتعريف في `diag` بس — **مش** قيمة `tool` في D1
 
 // ══════════════════════════════════════════════════════════════
@@ -387,33 +387,142 @@ function latestReturn(o) {
   return { latest: live[live.length - 1] || null, count: live.length };
 }
 
-// ─── §QUEUE::returnKinds — استبدال ولا استرجاع؟ (v1.2.0 · تمريرة تانية) ───
-// 🔴 `order-lifecycle` قاعدة 8: النوع من `return.exchangeLineItems` — **مش** من ميتافيلد.
-//    ⚠️ **والعكس مش صحيح:** الـ connection الفاضية = «مفيش قطع استبدال مسجّلة على الدورة دي»
-//    **مش** «ده استرجاع» (تعديل أوردر بعد تسجيل الاستبدال بيفضّيها للأبد — #53531 · #53701).
-//    عشان كده القيمة الراجعة `exchange` أو `return_unconfirmed` — مفيش `return` صريحة.
-// 🔴 **تمريرة تانية بـ`nodes(ids:)` على الـ Return نفسه** (مش جوّه استعلام الأوردرات): بلوك
-//    `exchangeLineItems` غالي (shopify-graphql-helper Step 10 · §3.4)، وهنا بيتجاب **لدورة
-//    واحدة بس لكل أوردر** (الأحدث غير الملغية) وبـ`first: 1` — مجرد «فيه ولا لأ».
-// ⚠️ **تكلفة الشريحة مش مقيسة** (`actualQueryCost`) — `RETURN_KIND_CHUNK` تخمين متحفّظ،
-//    وبتتسجّل في `queryCost` (op = `returnKinds`).
+// ─── §QUEUE::cycleTypes — استبدال ولا استرجاع؟ (v1.3.0 · order-lifecycle v1.11.1 · §2-D) ───
+// 🔴 قاعدة 8 (اتكتبت من جديد 22-11-2026): النوع من **دفتر المبيعات `order.agreements`** —
+//    مش من `exchangeLineItems` ومش من S2. الـ Order Edit بيغيّر نوع الدورة من غير ما يلمس
+//    الـ Return (استبدال اتحذف بديله = مرتجع · مرتجع اتضافت له قطعة = استبدال).
+//    `exchangeLineItems` بقت بتقول «اتعمل كإيه» بس، والفاضية فيها **مش دليل استرجاع**.
+// 🔴 **النوع النهائي (`finalType`) هو اللي بيتعرض** — والـ `createdType` بيتحفظ للمراجعة:
+//    `createdType ≠ finalType` = `TYPE_CONFLICT` (علامة، **مش** نقل — قاعدة 13).
+// 🔴 **الدفتر بيتقرا كله:** `agreements(first: 50)` **و** `hasNextPage` — `first: 10` كان بيضيّع
+//    **آخر** سجل (يعني أحدث Return) على أوردر فيه أكتر من ١٠ سجلات (#66880). دفتر ناقص =
+//    مفيش تصنيف (`null`)، **مش** تصنيف من نص الدفتر.
+// 🔴 **`ProductSale { lineItem { id } }` إلزامي** — من غيره استثناء «السالب على سطر قديم»
+//    (v1.11.1 · #66895) مابيشتغلش وبترجع النتيجة الغلط من غير أي error.
+// ⚠️ **الشرايح ≤ ٨ أوردرات** (١٠ بتتخطّى سقف الاستعلام ١٠٠٠). **التكلفة الفعلية مش مقيسة** —
+//    بتتسجّل في `queryCost` (op = `cycleTypes`) فاقرأها قبل ما تكبّر الشريحة.
 // ⚠️ **فشل التمريرة دي ما بيوقّعش الطابور** — النوع بس بيبقى غير معروف (`returnKind: null`)
 //    والواجهة بترجع للتسمية العامة، و`returnKindError` بيقول السبب في الرد.
-const RETURN_KIND_CHUNK = 25;
-const RETURN_KIND_QUERY = `
-query ReturnKinds($ids: [ID!]!) {
-  nodes(ids: $ids) { ... on Return { id exchangeLineItems(first: 1) { nodes { id } } } }
-}`;
-async function fetchReturnKinds(env, token, gids, costLog) {
-  const kinds = new Map();   // gid → true (فيه استبدال) | false (مفيش مسجّل)
-  for (let i = 0; i < gids.length; i += RETURN_KIND_CHUNK) {
-    const chunk = gids.slice(i, i + RETURN_KIND_CHUNK);
-    const data = await shopifyGQL(env, token, RETURN_KIND_QUERY, { ids: chunk }, 'returnKinds', costLog);
-    const nodes = data.data?.nodes;
-    if (!Array.isArray(nodes)) throw new Error('returnKinds: رد شوبيفاي بلا nodes');
-    for (const n of nodes) if (n?.id) kinds.set(n.id, (n.exchangeLineItems?.nodes?.length || 0) > 0);
+const CYCLE_TYPES_CHUNK = 8;
+const AGREEMENTS_MAX_PAGES = 10;   // حارس حلقة — ٥٠٠ سجل لأوردر واحد أكتر من أي واقع
+const AGREEMENT_NODE_FIELDS = `
+    id reason happenedAt
+    ... on ReturnAgreement { return { id } }
+    sales(first: 50) { nodes { actionType lineType quantity ... on ProductSale { lineItem { id } } } }`;
+const CYCLE_TYPES_QUERY = `
+query CycleTypes($ids: [ID!]!) {
+  nodes(ids: $ids) {
+    ... on Order {
+      id name
+      returns(first: 10, reverse: true) { nodes { id status createdAt closedAt } }
+      agreements(first: 50) {
+        pageInfo { hasNextPage endCursor }
+        nodes {${AGREEMENT_NODE_FIELDS}
+        }
+      }
+    }
   }
-  return kinds;
+}`;
+const MORE_AGREEMENTS_QUERY = `
+query MoreAgreements($id: ID!, $after: String!) {
+  node(id: $id) {
+    ... on Order {
+      agreements(first: 50, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes {${AGREEMENT_NODE_FIELDS}
+        }
+      }
+    }
+  }
+}`;
+
+// §SHARED::readCycleTypes — v1.11.1 (نسخة من `classification-rules.md` §2-D بالحرف)
+const gidNum = gid => Number(String(gid).split('/').pop());
+const byTimeThenId = (ta, tb, a, b) => String(ta).localeCompare(String(tb)) || (gidNum(a.id) - gidNum(b.id));
+function readCycleTypes(order) {
+  if (order.agreements?.pageInfo?.hasNextPage) {
+    throw new Error(`AGREEMENTS_TRUNCATED on ${order.name} — paginate before classifying`);
+  }
+  // PRODUCT only — FEE / SHIPPING sales carry quantity = null (#66869)
+  const productSales = ag => (ag.sales?.nodes || []).filter(s => s.lineType === 'PRODUCT');
+  const outgoingQty  = ag => productSales(ag)
+    .filter(s => s.actionType === 'ORDER' && s.quantity > 0)
+    .reduce((n, s) => n + s.quantity, 0);
+
+  const ags = [...(order.agreements?.nodes || [])]
+    .sort((a, b) => byTimeThenId(a.happenedAt, b.happenedAt, a, b));
+  const cycles = (order.returns?.nodes || [])
+    .filter(r => !['CANCELED', 'DECLINED'].includes(r.status))
+    .sort((a, b) => byTimeThenId(a.createdAt, b.createdAt, a, b));
+
+  return cycles.map(r => {
+    const i = ags.findIndex(a => a.reason === 'RETURN' && a.return?.id === r.id);
+    if (i === -1) return { returnId: r.id, createdType: null, finalType: null, flags: ['NO_AGREEMENT'] };
+
+    // سطور كانت موجودة **قبل** سجل الـ RETURN ده — السالب عليها = الأوردر الأصلي بيصغر
+    // مش جانب الخارج من الدورة (#66895 · v1.11.1).
+    const before  = new Set(ags.slice(0, i)
+      .flatMap(a => productSales(a).map(s => s.lineItem?.id)).filter(Boolean));
+    const editQty = ag => productSales(ag)
+      .filter(s => s.actionType === 'ORDER' || s.actionType === 'RETURN')
+      .filter(s => !(s.quantity < 0 && before.has(s.lineItem?.id)))
+      .reduce((n, s) => n + (s.quantity || 0), 0);
+
+    const nextRet = ags.findIndex((a, j) => j > i && a.reason === 'RETURN');
+    const edits   = ags.slice(i + 1, nextRet === -1 ? ags.length : nextRet)
+                       .filter(a => a.reason === 'ORDER_EDIT');      // REFUND وغيره بيتتجاهل
+    const created = outgoingQty(ags[i]);
+    const net     = created + edits.reduce((n, a) => n + editQty(a), 0);
+    const createdType = created > 0 ? 'EXCHANGE' : 'RETURN';
+    const finalType   = net     > 0 ? 'EXCHANGE' : 'RETURN';
+
+    const flags = [];
+    if (edits.length)              flags.push('EDITED_AFTER_RETURN');
+    if (createdType !== finalType) flags.push('TYPE_CONFLICT');
+    const afterClose = r.closedAt ? edits.filter(a => a.happenedAt > r.closedAt) : [];
+    if (afterClose.length)                   flags.push('EDIT_AFTER_CLOSE');
+    if (afterClose.length && nextRet !== -1) flags.push('EDIT_BETWEEN_CYCLES');
+
+    return { returnId: r.id, createdType, finalType, outgoingQty: net, flags };
+  });
+}
+
+// بيكمّل صفحات الدفتر لأوردر واحد لحد `hasNextPage = false` (أو الحارس) — الدفتر الناقص مايتصنّفش منه.
+async function completeAgreements(env, token, order, costLog) {
+  let pages = 0;
+  while (order.agreements?.pageInfo?.hasNextPage && pages < AGREEMENTS_MAX_PAGES) {
+    const data = await shopifyGQL(env, token, MORE_AGREEMENTS_QUERY,
+      { id: order.id, after: order.agreements.pageInfo.endCursor }, 'cycleTypesMore', costLog);
+    const more = data.data?.node?.agreements;
+    if (!more) throw new Error(`cycleTypesMore: رد شوبيفاي بلا agreements على ${order.name}`);
+    order.agreements = {
+      pageInfo: more.pageInfo,
+      nodes: [...(order.agreements.nodes || []), ...(more.nodes || [])],
+    };
+    pages++;
+  }
+}
+
+// gid **الأوردر** → { type: 'RETURN'|'EXCHANGE'|null, flags: [...] } لأحدث دورة غير ملغية.
+// ⚠️ أي أوردر فشل تصنيفه (دفتر ناقص مثلاً) **بيتساب بره الـ Map** = نوعه مجهول، مش بيوقّع الباقي.
+async function fetchCycleTypes(env, token, gids, costLog, errors) {
+  const out = new Map();
+  for (let i = 0; i < gids.length; i += CYCLE_TYPES_CHUNK) {
+    const chunk = gids.slice(i, i + CYCLE_TYPES_CHUNK);
+    const data = await shopifyGQL(env, token, CYCLE_TYPES_QUERY, { ids: chunk }, 'cycleTypes', costLog);
+    const nodes = data.data?.nodes;
+    if (!Array.isArray(nodes)) throw new Error('cycleTypes: رد شوبيفاي بلا nodes');
+    for (const n of nodes) {
+      if (!n?.id) continue;
+      try {
+        await completeAgreements(env, token, n, costLog);
+        const cycles = readCycleTypes(n);
+        const last = cycles[cycles.length - 1];
+        if (last) out.set(n.id, { type: last.finalType, flags: last.flags });
+      } catch (e) { errors.push(e.message); }
+    }
+  }
+  return out;
 }
 
 // ─── §QUEUE::shapeOrder ───
@@ -465,11 +574,16 @@ function shapeOrder(o, kinds = null) {
     returnName:        lastReturn?.name      || null,   // مثلاً #62855-R2
     returnStatus:      lastReturn?.status    || null,
     returnCycles,                                       // عدد الدورات غير الملغية (>1 = أكتر من دورة)
-    // 🟢 v1.2.0 — `exchange` لو أحدث دورة فيها قطع استبدال مسجّلة · `return_unconfirmed` لو فاضية
-    //    (مش «استرجاع» — قاعدة 8) · `null` لو مفيش دورة أو التمريرة التانية فشلت/ما رجّعتش الدورة دي.
-    returnKind: !lastReturn || !kinds || !kinds.has(lastReturn.id)
+    // 🟢 v1.3.0 — نوع **أحدث** دورة غير ملغية من دفتر المبيعات (order-lifecycle v1.11.1 · §2-D):
+    //    `exchange` | `return` | `null` (مفيش دورة · NO_AGREEMENT · دفتر ناقص · التمريرة فشلت).
+    //    ⚠️ `return` دلوقتي **مؤكَّدة** من الدفتر (كانت `return_unconfirmed` في 1.2.0 من `exchangeLineItems`).
+    returnKind: !lastReturn || !kinds || !kinds.has(o.id)
       ? null
-      : (kinds.get(lastReturn.id) ? 'exchange' : 'return_unconfirmed'),
+      : (kinds.get(o.id).type === 'EXCHANGE' ? 'exchange'
+        : kinds.get(o.id).type === 'RETURN' ? 'return' : null),
+    // أعلام الدورة (`TYPE_CONFLICT` · `EDITED_AFTER_RETURN` · `EDIT_AFTER_CLOSE` · `EDIT_BETWEEN_CYCLES` ·
+    // `NO_AGREEMENT`) — **بتتعلّم ومابتتحرّكش** (قاعدة 13). `[]` لو الدورة نضيفة أو مجهولة.
+    returnFlags: (lastReturn && kinds && kinds.get(o.id)?.flags) || [],
   };
 }
 
@@ -531,14 +645,16 @@ async function handleQueue(env, request) {
     fetchStatusPage(env, token, queueQ(since, `metafields.custom.status_2_r_e:'${S2_STATUS.IN_RETURN}'`),  'inReturnS2'),
   ]);
 
-  // v1.2.0 — نوع الدورة (استبدال/استرجاع) بتمريرة تانية على أحدث دورة لكل أوردر
+  // v1.3.0 — نوع الدورة (استبدال/استرجاع) من دفتر `agreements` بتمريرة تانية — لأوردرات عليها Return بس
   const allNodes = [...a.nodes, ...b.nodes];
-  const kindGids = [...new Set(allNodes.map(n => latestReturn(n).latest?.id).filter(Boolean))];
+  const kindGids = [...new Set(allNodes.filter(n => latestReturn(n).latest).map(n => n.id))];   // أوردرات عليها Return بس
   const kindCost = [];
+  const kindErrors = [];
   let kinds = null, returnKindError = null;
   if (kindGids.length) {
-    try { kinds = await fetchReturnKinds(env, token, kindGids, kindCost); }
+    try { kinds = await fetchCycleTypes(env, token, kindGids, kindCost, kindErrors); }
     catch (e) { returnKindError = e.message; }   // ⚠️ مش بنوقّع الطابور — النوع بس بيبقى مجهول
+    if (!returnKindError && kindErrors.length) returnKindError = `${kindErrors.length} أوردر بلا تصنيف: ${kindErrors[0]}`;
   }
   const kc = kindCost.map(c => c.actual).filter(n => typeof n === 'number');
 
@@ -562,7 +678,7 @@ async function handleQueue(env, request) {
     //    (مش رقم مجمّع).
     returnKindError,       // null = تمام · نص = التمريرة التانية فشلت (النوع مجهول، الطابور سليم)
     queryCost: [a.cost, b.cost,
-      { op: 'returnKinds', pages: kindCost.length, truncated: false,
+      { op: 'cycleTypes', pages: kindCost.length, truncated: false,
         requested: kindCost[0]?.requested ?? null, actualMax: kc.length ? Math.max(...kc) : null }],
     fetchedAt: new Date().toISOString(),
     cairoDate: cairoDate(),

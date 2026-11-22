@@ -2,13 +2,13 @@
 
 # طابور «في طريق الرجوع» — In-Return Orders (`In-Return-Orders`)
 
-![version](https://img.shields.io/badge/worker-v1.0.0-blue)
+![version](https://img.shields.io/badge/worker-v1.3.0-blue)
 
 **بتعمل إيه:** بترجّع الأوردرات اللي حالتها **`In-Return`** — مرتجعة وفي طريقها
 للمخزن و**محدش سجّل لها `Returned`** لسه — في الشحنة الأصلية
 (`custom.manual_status`) أو دورة الاستبدال/الاسترجاع (`custom.status_2_r_e`).
 **مين بيستخدمها:** الشحن والتحصيل
-**الإصدار:** `1.2.0` (`WORKER_VERSION` في `index.js`)
+**الإصدار:** `1.3.0` (`WORKER_VERSION` في `index.js`)
 
 > 🔴 **الريبو ده Worker وبس — مفيش واجهة هنا ومفيش نسخة مستقلة.** الواجهة
 > الوحيدة هي **`In-Return-Orders.html`** جوّه `Delivery-COD-Operations-Center`
@@ -94,11 +94,20 @@ created_at:>='<بداية 01/04/2026 بتوقيت القاهرة>'     ← ال�
   `null` على أوردر RTO بلا Return. 🔴 **بتتطلب `read_returns`** وغيابها بيوقّع الطابور كله
   (بند في `diag`). الاستعلام `returns(first: 10, reverse: true)` بـ`createdAt status` بس.
   ⚠️ **التكلفة مش مقيسة** بعد الإضافة — راجع `queryCost` أول فتح.
-- 🟢 **`1.2.0` — نوع الدورة:** `returnKind` = `exchange` (أحدث دورة فيها `exchangeLineItems`) ·
-  `return_unconfirmed` (فاضية — **مش «استرجاع»**، قاعدة 8: تعديل أوردر بعد تسجيل الاستبدال بيفضّيها)
-  · `null` (مفيش دورة أو التمريرة التانية فشلت). بتتجاب بـ`nodes(ids:)` على الـ`Return` نفسه
-  (أحدث دورة لكل أوردر · `first: 1` · شرايح `RETURN_KIND_CHUNK = 25`). 🔴 فشلها **ما بيوقّعش الطابور**
-  — `returnKindError` في الرد. ⚠️ **تكلفتها مش مقيسة** — راجع `queryCost` (`op: 'returnKinds'`).
+- 🟢 **`1.3.0` — نوع الدورة من دفتر المبيعات** (`order-lifecycle` v1.11.1 · قاعدة 8 · `classification-rules.md` §2-D):
+  `returnKind` = `exchange` | `return` | `null` — **النوع النهائي** لأحدث دورة غير ملغية (مرتّبة بـ`(createdAt, id)`).
+  🔴 **مش من `exchangeLineItems` ومش من S2** — تعديل الأوردر بعد الإنشاء بيغيّر النوع من غير ما يلمس الـ Return
+  (استبدال اتحذف بديله = **مرتجع** · مرتجع اتضافت له قطعة = **استبدال**). `return` دلوقتي **مؤكَّدة** من الدفتر
+  (كانت `return_unconfirmed` في 1.2.0 — القيمة دي لسه بتتفهم في الواجهة لو Worker أقدم).
+  بتتجاب بتمريرة تانية `nodes(ids:)` على **الأوردر** (شرايح `CYCLE_TYPES_CHUNK = 8` — ١٠ بتتخطّى سقف ١٠٠٠) لأوردرات عليها Return بس:
+  `returns` + `agreements(first: 50)` **مع** `hasNextPage` (بيكمّل صفحات `MoreAgreements` لحد `AGREEMENTS_MAX_PAGES`) —
+  ⛔ دفتر ناقص **مايتصنّفش** (`null`)، و`ProductSale { lineItem { id } }` **إلزامي** (استثناء السالب على سطر قديم · #66895).
+  `readCycleTypes()` نسخة من المهارة بالحرف.
+  🟢 **`returnFlags`** (جديد): `TYPE_CONFLICT` · `EDITED_AFTER_RETURN` · `EDIT_AFTER_CLOSE` · `EDIT_BETWEEN_CYCLES` · `NO_AGREEMENT` —
+  **بتتعلّم ومابتتحرّكش** (قاعدة 13)؛ الواجهة بتحوّلها لعلامات مراجعة على صفوف S2.
+  🔴 فشلها **ما بيوقّعش الطابور** — `returnKindError` في الرد (والأوردر اللي فشل تصنيفه `returnKind: null`).
+  ⚠️ **تكلفتها مش مقيسة** — راجع `queryCost` (`op: 'cycleTypes'` + `cycleTypesMore`) قبل تكبير الشريحة.
+- ⚠️ **S2 مش مصدر نوع** (`S2_STALE` — G-18): الـ Flow بيكتبه وقت الإنشاء وما بيرجعش يكتبه بعد التعديل، فمفيش مقارنة بيه هنا.
 - ⚠️ **الشكل عقد**: `ecoShapeRow` و`ecoFlags` و`ecoCod` في `shared/dco-rules.js`
   بيقروا المفاتيح بالاسم. تغيير اسم مفتاح = عمود بيرجع `—` بلا أي خطأ.
 - 🔴 `currentTotalPriceSet` مش `totalPriceSet` (قاعدة ٣) · 🔴 `orderId` رقمي ·
@@ -176,11 +185,11 @@ Step 3 (أداة قراءة → wildcard): الرد فيه اسم العميل �
 |---|---|
 | ecommoda-worker-builder | **v3.10.0** |
 | ecommoda-constants | **v4.4.0** |
-| ecommoda-order-lifecycle | **v1.9.0** |
+| ecommoda-order-lifecycle | **v1.11.1** |
 | shopify-graphql-helper | **v2.4.0** |
 | ecommoda-html-builder | **v8.6.0** (الواجهة في ريبو الهب — البصمة هنا للتوثيق) |
 
-آخر مطابقة: 01-11-2026 · الـ Worker `1.0.0`
+آخر مطابقة: 22-11-2026 · الـ Worker `1.3.0`
 
 ---
 
@@ -190,5 +199,7 @@ Step 3 (أداة قراءة → wildcard): الرد فيه اسم العميل �
 وبندين منفصلين للتكلفة. ما اتجرّبش على شوبيفاي حقيقية.)
 
 آخر تحديث: 01-11-2026 — 12:00
+
+آخر تحديث: 22-11-2026 — `1.3.0` (طلب أحمد: تصنيف استبدال/استرجاع من دفتر `order.agreements` على `order-lifecycle` v1.11.1 بدل `exchangeLineItems` + `returnFlags`. الواجهة في ريبو الهب v2.9.0. اتجرّب منطق `readCycleTypes` على حالات الدفتر (#66895 · حذف البديل · قطعة بعد مرتجع · NO_AGREEMENT) — **ما اتجرّبش على شوبيفاي حقيقية**، وتكلفة الاستعلام مش مقيسة.)
 
 </div>
